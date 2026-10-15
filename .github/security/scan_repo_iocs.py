@@ -10,13 +10,16 @@ INFECTED (confirmed): .vscode folderOpen task / auto-tasks on; a font-extension 
 fa-solid-* decoy; a PolinRider marker in any JS/TS file; XCSSET in project.pbxproj; ignore-file lines naming the
 temp_*_push.bat / config.bat droppers; those droppers themselves.
 WARN (heuristic only): a config file with a padded/obfuscated >1500-char line but no PolinRider marker.
-Skips node_modules, .git, dist, build, .next, Pods, .dart_tool, vendor, virtualenvs.
+Also INFECTED: a Git LFS pointer in place of a .vscode / config / ignore / .bat file (hides the real content).
+Names are matched case-insensitively; symlinks are followed inside the scanned folder only.
+Skips .git, node_modules and virtualenvs (build output is scanned: the worm runs payloads from dist/).
 """
 import os
 import re
 import sys
 
-SKIP_DIRS = {'node_modules', '.git', 'dist', 'build', '.next', 'Pods', '.dart_tool', 'vendor', '.venv', 'venv'}
+SKIP_DIRS = {'node_modules', '.git', '.venv', 'venv'}
+LFS = b'version https://git-lfs'
 CONFIG = re.compile(r'(^|/)([^/]*\.config\.(m|c)?(j|t)s|\.eslintrc(\.c?js)?|\.prettierrc\.c?js)$')
 FONT_EXT = re.compile(r'\.(woff2?|ttf|otf|eot|llf|lkf)$', re.I)
 FONT_MAGIC = (b'wOF2', b'wOFF', b'\x00\x01\x00\x00', b'OTTO', b'true', b'typ1')
@@ -28,7 +31,7 @@ XCSSET = re.compile(rb'base64 (-D|--decode)[^\n"]{0,80}\|\s*(ba)?sh\b|xxd -p -r[
 DROPPER_LINE = re.compile(rb'^\s*/?(temp_[a-z_]*push|config)\.bat\s*\r?$', re.I | re.M)
 DROPPER_FILE = re.compile(r'(^|/)(temp_[a-z_]*push|config)\.bat$', re.I)
 JS = re.compile(r'\.(m|c)?(j|t)sx?$')
-PAD = re.compile(rb'[ \t]{60,}\S')
+PAD = re.compile(rb'(?<![ \t])[ \t]{60,}\S')   # lookbehind keeps it linear on long whitespace runs
 OBF = re.compile(rb'_0x[0-9a-f]{4,6}')
 CMD = re.compile(r'"command"\s*:\s*"((?:[^"\\]|\\.)*)"')
 AUTO_ON = re.compile(rb'"task\.allowAutomaticTasks"\s*:\s*(true|"on")')
@@ -45,6 +48,7 @@ def payload(data):
 
 
 def kind_of(rel, n):
+    rel, n = rel.lower(), n.lower()   # case-insensitive disks (macOS, Windows) load .VSCode/ and x.config.JS too
     if '/.vscode/' in '/' + rel and n.endswith('.json'):
         return 'vscode'
     if FONT_EXT.search(n):
@@ -62,22 +66,44 @@ def kind_of(rel, n):
     return None
 
 
+def inside(root_real, p):
+    """Real path of p if it stays inside the scanned folder, else None (never read outside it)."""
+    rp = os.path.realpath(p)
+    return rp if rp == root_real or rp.startswith(root_real + os.sep) else None
+
+
 def scan(root):
     hits, files = [], 0
-    for d, dirs, names in os.walk(root):
-        dirs[:] = [x for x in dirs if x not in SKIP_DIRS]
+    root_real = os.path.realpath(root)
+    seen = {(root_real, False)}
+    for d, dirs, names in os.walk(root, followlinks=True):
+        keep = []
+        for x in dirs:   # follow directory links inside the root; (real dir, under .vscode) visited once -> no cycles
+            rp = inside(root_real, os.path.join(d, x))
+            key = (rp, '/.vscode/' in '/' + os.path.relpath(os.path.join(d, x), root).lower() + '/')
+            if x not in SKIP_DIRS and rp and key not in seen:
+                seen.add(key)
+                keep.append(x)
+        dirs[:] = keep
         for n in names:
             p = os.path.join(d, n)
             rel = os.path.relpath(p, root).replace(os.sep, '/')
+            kind = kind_of(rel, n)
+            real = inside(root_real, p) if kind else None
             try:
-                if os.path.islink(p) or os.path.getsize(p) > 2_000_000:
+                if not real or not os.path.isfile(real):
                     continue
-                kind = kind_of(rel, n)
-                if not kind:
+                if kind in ('js', 'font') and os.path.getsize(real) > 2_000_000:
                     continue
                 files += 1
-                data = open(p, 'rb').read()
+                data = open(real, 'rb').read()
             except OSError:
+                continue
+            if data.startswith(LFS):
+                if kind in ('vscode', 'config', 'ignore', 'bat'):
+                    hits.append(('INFECTED', rel, 'Git LFS pointer instead of the file: content hidden from scans'))
+                elif kind in ('js', 'pbxproj'):
+                    hits.append(('WARN', rel, 'Git LFS pointer: content not scanned'))
                 continue
             if kind == 'vscode' and b'folderOpen' in data:
                 cmds = CMD.findall(data.decode('utf-8', 'ignore'))
@@ -106,17 +132,23 @@ def scan(root):
 
 
 def main():
+    """Exit 1 only for INFECTED; 3 for a scanner error (CI must not report that as malware)."""
+    sys.stdout.reconfigure(errors='backslashreplace')
     if len(sys.argv) < 2:
         print(__doc__)
         return 2
     infected = False
-    for root in sys.argv[1:]:
-        hits, files = scan(root)
-        state = 'INFECTED' if any(s == 'INFECTED' for s, _, _ in hits) else 'WARN' if hits else 'clean'
-        print(f'{root}: checked {files} candidate files -> {state}')
-        for sev, rel, why in hits:
-            print(f'   {sev} {rel}: {why}')
-        infected |= state == 'INFECTED'
+    try:
+        for root in sys.argv[1:]:
+            hits, files = scan(root)
+            state = 'INFECTED' if any(s == 'INFECTED' for s, _, _ in hits) else 'WARN' if hits else 'clean'
+            print(f'{root}: checked {files} candidate files -> {state}')
+            for sev, rel, why in hits:
+                print(f'   {sev} {rel}: {why}')
+            infected |= state == 'INFECTED'
+    except Exception as e:
+        print(f'scanner error: {e!r}')
+        return 3
     return 1 if infected else 0
 
 
